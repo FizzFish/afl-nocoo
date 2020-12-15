@@ -90,7 +90,7 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
-
+static u32 syscall_num = 0;
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
@@ -142,7 +142,9 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
            fsrv_ctl_fd,               /* Fork server control pipe (write) */
-           fsrv_st_fd;                /* Fork server status pipe (read)   */
+           fsrv_st_fd,                /* Fork server status pipe (read)   */
+           recv_fd,
+           send_fd;
 
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
@@ -238,10 +240,11 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
-#define PRE_SYS_NUM 20
+#define PRE_SYS_NUM 10
 static u32 pre_syscalls[PRE_SYS_NUM];
 static u32 strace_p = 0;
-static int init_pre_syscalls = 0;
+static int first_fuzz_strace = 1;
+static int first_pre_strace = 1;
 
 struct queue_entry {
 
@@ -2010,13 +2013,13 @@ static void destroy_extras(void) {
 EXP_ST void init_forkserver(char** argv) {
 
   static struct itimerval it;
-  int st_pipe[2], ctl_pipe[2], strace_pipe[2];
+  int st_pipe[2], ctl_pipe[2], recv_pipe[2], send_pipe[2];
   int status;
   s32 rlen;
 
   ACTF("Spinning up the fork server...");
 
-  if (pipe(st_pipe) || pipe(ctl_pipe) || pipe(strace_pipe)) PFATAL("pipe() failed");
+  if (pipe(st_pipe) || pipe(ctl_pipe) || pipe(recv_pipe) || pipe(send_pipe)) PFATAL("pipe() failed");
 
   forksrv_pid = fork();
 
@@ -2070,7 +2073,7 @@ EXP_ST void init_forkserver(char** argv) {
     setsid();
 
     //dup2(dev_null_fd, 1);
-    dup2(dev_null_fd, 2);
+    //dup2(dev_null_fd, 2);
 
     if (out_file) {
 
@@ -2087,14 +2090,17 @@ EXP_ST void init_forkserver(char** argv) {
 
     if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
     if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
-    if (dup2(strace_pipe[0], STRACE_FD) < 0) PFATAL("dup2() failed");
+    if (dup2(recv_pipe[1], STRACE_FD) < 0) PFATAL("dup2() failed");
+    if (dup2(send_pipe[0], STRACE_FD + 1) < 0) PFATAL("dup2() failed");
 
     close(ctl_pipe[0]);
     close(ctl_pipe[1]);
     close(st_pipe[0]);
     close(st_pipe[1]);
-    close(strace_pipe[0]);
-    close(strace_pipe[1]);
+    close(recv_pipe[0]);
+    close(recv_pipe[1]);
+    close(send_pipe[0]);
+    close(send_pipe[1]);
 
     close(out_dir_fd);
     close(dev_null_fd);
@@ -2135,12 +2141,14 @@ EXP_ST void init_forkserver(char** argv) {
 
   close(ctl_pipe[0]);
   close(st_pipe[1]);
+  close(recv_pipe[1]);
+  close(send_pipe[0]);
 
   fsrv_ctl_fd = ctl_pipe[1];
   fsrv_st_fd  = st_pipe[0];
-  if (dup2(strace_pipe[1], STRACE_FD) < 0) PFATAL("dup2() failed");
-  close(strace_pipe[0]);
-  close(strace_pipe[1]);
+  recv_fd = recv_pipe[0];
+  send_fd = send_pipe[1];
+  printf("fuzzer keep %d,%d,%d,%d\n", fsrv_ctl_fd, fsrv_st_fd, recv_fd, send_fd);
 
   /* Wait for the fork server to come up, but don't wait too long. */
 
@@ -2301,7 +2309,6 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
   static struct itimerval it;
   static u32 prev_timed_out = 0;
   static u64 exec_ms = 0;
-  static int strace_pipe[2];
 
   int status = 0;
   u32 tb4;
@@ -2323,11 +2330,7 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
      execve(). There is a bit of code duplication between here and 
      init_forkserver(), but c'est la vie. */
 
-  if (dumb_mode == 1 || no_forkserver || pre) {
-      if(pre) {
-          if (pipe(strace_pipe)) PFATAL("pipe() failed");
-
-      }
+  if (dumb_mode == 1 || no_forkserver) {
 
     child_pid = fork();
 
@@ -2362,7 +2365,7 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
 
       setsid();
 
-      //dup2(dev_null_fd, 1);
+      dup2(dev_null_fd, 1);
       dup2(dev_null_fd, 2);
 
       if (out_file) {
@@ -2374,11 +2377,6 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
         dup2(out_fd, 0);
         close(out_fd);
 
-      }
-      // qemu can write syscall num to STRACE_FD
-      if(pre) {
-          dup2(strace_pipe[1], STRACE_FD);
-          close(strace_pipe[0]);
       }
 
       /* On Linux, would be faster to use O_CLOEXEC. Maybe TODO. */
@@ -2420,16 +2418,17 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
       RPFATAL(res, "Unable to request new process from fork server (OOM?)");
 
     }
-    if(fuzz && !init_pre_syscalls) {
-        init_pre_syscalls = 1;
-    printf("%s %d: fuzz write syscalls\n", __func__, __LINE__);
+    if(fuzz && first_fuzz_strace) {
+        first_fuzz_strace = 0;
+        printf("%s %d: fuzzer send syscalls\n", __func__, __LINE__);
         int order_pre_syscalls[PRE_SYS_NUM];
         int i;
-        for(i=0;i<PRE_SYS_NUM;i++) order_pre_syscalls[i] = pre_syscalls[(i+strace_p)%PRE_SYS_NUM];
-      for(i=0;i<PRE_SYS_NUM;i++)
-      printf("syscall[%d]=%d ", i, order_pre_syscalls[i]);
-      printf("\n");
-        if (write(STRACE_FD, order_pre_syscalls, 4 * PRE_SYS_NUM) != 4 * PRE_SYS_NUM) {
+        for(i=0;i<PRE_SYS_NUM;i++) {
+            order_pre_syscalls[i] = pre_syscalls[(i+strace_p)%PRE_SYS_NUM];
+            printf("syscall[%d]=%d ", i, order_pre_syscalls[i]);
+        }
+        printf("\n");
+        if (write(send_fd, order_pre_syscalls, 4 * PRE_SYS_NUM) != 4 * PRE_SYS_NUM) {
           if (stop_soon) return 0;
           RPFATAL(res, "Unable to send pre_syscalls to qemu");
         }
@@ -2451,7 +2450,7 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
   it.it_value.tv_sec = (timeout / 1000);
   it.it_value.tv_usec = (timeout % 1000) * 1000;
   if(pre) {
-      it.it_value.tv_sec = 5;//(timeout / 1000);
+      it.it_value.tv_sec = 3;//(timeout / 1000);
       it.it_value.tv_usec = 0;//(timeout % 1000) * 1000;
   }
 
@@ -2459,20 +2458,18 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
 
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
   if(pre) {
-      dup2(strace_pipe[0], STRACE_FD);
-      close(strace_pipe[1]);
       int num;
-      while(read(STRACE_FD, &num, 4) == 4) {
+      while(read(recv_fd, &num, 4) == 4) {
         pre_syscalls[strace_p] = num;
         strace_p = (strace_p + 1) % PRE_SYS_NUM;
+        syscall_num++;
       }
+      printf("fuzzer recv %d syscalls\n", syscall_num);
   }
 
-  if (dumb_mode == 1 || no_forkserver || pre) {
+  if (dumb_mode == 1 || no_forkserver) {
 
     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
-    printf("**********************************************\n");
-    printf("status is %d\n", status);
 
 
   } else {
@@ -2484,6 +2481,10 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
       if (stop_soon) return 0;
       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
 
+    }
+    if(pre) {
+        printf("**********************************************\n");
+        printf("status is %d\n", status);
     }
 
   }
@@ -2670,8 +2671,12 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
 
     write_to_testcase(use_mem, q->len);
-
-    fault = run_target(argv, use_tmout);
+    if(first_pre_strace && qemu_mode) {
+        _run_target(argv, exec_tmout, 1);
+        first_pre_strace = 0;
+    } else {
+        fault = run_target(argv, use_tmout);
+    }
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
@@ -6903,7 +6908,6 @@ static void handle_skipreq(int sig) {
 /* Handle timeout (SIGALRM). */
 
 static void handle_timeout(int sig) {
-
   if (child_pid > 0) {
 
     child_timed_out = 1; 
@@ -7736,7 +7740,7 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
   new_argv[2] = target_path;
-  new_argv[1] = "-pre_strace";
+  new_argv[1] = "-fuzz_strace";
 
   /* Now we need to actually find the QEMU binary to put in argv[0]. */
 
@@ -8116,8 +8120,6 @@ int main(int argc, char** argv) {
 
   if (qemu_mode) {
     use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
-    _run_target(use_argv, exec_tmout, 1);
-    use_argv[1] = "-fuzz_strace";
   } else
     use_argv = argv + optind;
 
