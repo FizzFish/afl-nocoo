@@ -90,7 +90,6 @@
 /* Lots of globals, but mostly for the status UI and other things where it
    really makes no sense to haul them around as function parameters. */
 
-static u32 syscall_num = 0;
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
@@ -240,14 +239,10 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 static FILE* plot_file;               /* Gnuplot output file              */
 
-#define PRE_SYS_NUM 10
-static u32 pre_syscalls[PRE_SYS_NUM];
-static u32 strace_p = 0;
 #define FUZZ_STRACE 2
 #define PRE_STRACE 1
 #define NORMAL 0
 #define CFG 3
-static int first_fuzz_strace = 1;
 static int first_pre_strace = 1;
 static int first_cfg = 1;
 static int cur_mode = 0;
@@ -2097,17 +2092,11 @@ EXP_ST void init_forkserver(char** argv)
 
     if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
     if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
-    if (dup2(recv_pipe[1], STRACE_FD) < 0) PFATAL("dup2() failed");
-    if (dup2(send_pipe[0], STRACE_FD + 1) < 0) PFATAL("dup2() failed");
 
     close(ctl_pipe[0]);
     close(ctl_pipe[1]);
     close(st_pipe[0]);
     close(st_pipe[1]);
-    close(recv_pipe[0]);
-    close(recv_pipe[1]);
-    close(send_pipe[0]);
-    close(send_pipe[1]);
 
     close(out_dir_fd);
     close(dev_null_fd);
@@ -2134,7 +2123,7 @@ EXP_ST void init_forkserver(char** argv)
                            "abort_on_error=1:"
                            "allocator_may_return_null=1:"
                            "msan_track_origins=0", 0);
-    printf("%s %d: %s %s %s %s %s\n", __func__, __LINE__, target_path, argv[0], argv[1], argv[2], argv[3]);
+    //printf("%s %d: %s %s %s %s %s\n", __func__, __LINE__, target_path, argv[0], argv[1], argv[2], argv[3]);
     execv(target_path, argv);
 
     /* Use a distinctive bitmap signature to tell the parent about execv()
@@ -2156,7 +2145,7 @@ EXP_ST void init_forkserver(char** argv)
   fsrv_st_fd  = st_pipe[0];
   recv_fd = recv_pipe[0];
   send_fd = send_pipe[1];
-  printf("fuzzer keep %d,%d,%d,%d\n", fsrv_ctl_fd, fsrv_st_fd, recv_fd, send_fd);
+  //printf("fuzzer keep %d,%d,%d,%d\n", fsrv_ctl_fd, fsrv_st_fd, recv_fd, send_fd);
 
   /* Wait for the fork server to come up, but don't wait too long. */
 
@@ -2323,10 +2312,6 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
   u32 tb4;
 
   child_timed_out = 0;
-  u32 pre = 0, fuzz = 0, cfg = 0;
-  if(mode == 1) pre = 1;
-  else if (mode == 2) fuzz = 1;
-  else if (mode == 3) cfg = 1;
 
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
@@ -2428,21 +2413,6 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
       RPFATAL(res, "Unable to request new process from fork server (OOM?)");
 
     }
-    if(fuzz && first_fuzz_strace) {
-        first_fuzz_strace = 0;
-        printf("%s %d: fuzzer send syscalls\n", __func__, __LINE__);
-        int order_pre_syscalls[PRE_SYS_NUM];
-        int i;
-        for(i=0;i<PRE_SYS_NUM;i++) {
-            order_pre_syscalls[i] = pre_syscalls[(i+strace_p)%PRE_SYS_NUM];
-            printf("syscall[%d]=%d ", i, order_pre_syscalls[i]);
-        }
-        printf("\n");
-        if (write(send_fd, order_pre_syscalls, 4 * PRE_SYS_NUM) != 4 * PRE_SYS_NUM) {
-          if (stop_soon) return 0;
-          RPFATAL(res, "Unable to send pre_syscalls to qemu");
-        }
-    }
 
     if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
 
@@ -2459,22 +2429,13 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
 
   it.it_value.tv_sec = (timeout / 1000);
   it.it_value.tv_usec = (timeout % 1000) * 1000;
-  if (cfg)
+  if (mode == CFG)
       it.it_value.tv_sec = 10;
-  else if (pre)
+  if (mode == PRE_STRACE)
       it.it_value.tv_sec = 3;
   setitimer(ITIMER_REAL, &it, NULL);
 
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
-  if(pre) {
-      int num;
-      while(read(recv_fd, &num, 4) == 4) {
-        pre_syscalls[strace_p] = num;
-        strace_p = (strace_p + 1) % PRE_SYS_NUM;
-        syscall_num++;
-      }
-      printf("fuzzer recv %d syscalls\n", syscall_num);
-  }
 
   if (dumb_mode == 1 || no_forkserver) {
 
@@ -2491,9 +2452,9 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
 
     }
-    if(cfg || pre) {
+    if(mode == PRE_STRACE || mode == CFG) {
         printf("*********************************************\n");
-        printf("status is %d\n", status);
+        printf("%d status is %d\n", cur_mode, status);
     }
 
   }
@@ -2564,19 +2525,19 @@ static u8 run_target(char** argv, u32 timeout) {
     if(first_cfg) {
         cur_mode = CFG;
         first_cfg = 0;
-        return _run_target(argv, exec_tmout, 3);
+        return _run_target(argv, exec_tmout, CFG);
     }
-    else if(first_pre_strace && qemu_mode) {
+    else if(first_pre_strace) {
         cur_mode = PRE_STRACE;
         first_pre_strace = 0;
-        return _run_target(argv, exec_tmout, 1);
+        return _run_target(argv, exec_tmout, PRE_STRACE);
     }
     else if(cur_mode == FUZZ_STRACE) {
         printf("%s PRE_STRACE timeout, then goto FUZZ_STRACE mode\n", __func__);
-        return _run_target(argv, timeout, 2);
+        return _run_target(argv, timeout, FUZZ_STRACE);
     }
     cur_mode = NORMAL;
-    return _run_target(argv, timeout, 0);
+    return _run_target(argv, timeout, NORMAL);
 }
 
 /* Write modified data to file for testing. If out_file is set, the old file
@@ -7768,7 +7729,7 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
   new_argv[2] = target_path;
-  new_argv[1] = "-fuzz_strace";
+  new_argv[1] = "-fuzz";
 
   /* Now we need to actually find the QEMU binary to put in argv[0]. */
 
