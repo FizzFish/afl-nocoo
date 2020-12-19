@@ -243,8 +243,14 @@ static FILE* plot_file;               /* Gnuplot output file              */
 #define PRE_SYS_NUM 10
 static u32 pre_syscalls[PRE_SYS_NUM];
 static u32 strace_p = 0;
+#define FUZZ_STRACE 2
+#define PRE_STRACE 1
+#define NORMAL 0
+#define CFG 3
 static int first_fuzz_strace = 1;
 static int first_pre_strace = 1;
+static int first_cfg = 1;
+static int cur_mode = 0;
 
 struct queue_entry {
 
@@ -2010,7 +2016,8 @@ static void destroy_extras(void) {
    cloning a stopped child. So, we just execute once, and then send commands
    through a pipe. The other part of this logic is in afl-as.h. */
 
-EXP_ST void init_forkserver(char** argv) {
+EXP_ST void init_forkserver(char** argv)
+{
 
   static struct itimerval it;
   int st_pipe[2], ctl_pipe[2], recv_pipe[2], send_pipe[2];
@@ -2073,7 +2080,7 @@ EXP_ST void init_forkserver(char** argv) {
     setsid();
 
     //dup2(dev_null_fd, 1);
-    //dup2(dev_null_fd, 2);
+    dup2(dev_null_fd, 2);
 
     if (out_file) {
 
@@ -2127,6 +2134,7 @@ EXP_ST void init_forkserver(char** argv) {
                            "abort_on_error=1:"
                            "allocator_may_return_null=1:"
                            "msan_track_origins=0", 0);
+    printf("%s %d: %s %s %s %s %s\n", __func__, __LINE__, target_path, argv[0], argv[1], argv[2], argv[3]);
     execv(target_path, argv);
 
     /* Use a distinctive bitmap signature to tell the parent about execv()
@@ -2304,7 +2312,8 @@ EXP_ST void init_forkserver(char** argv) {
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update trace_bits[]. */
 
-static u8 _run_target(char** argv, u32 timeout, u32 mode) {
+static u8 _run_target(char** argv, u32 timeout, u32 mode)
+{
 
   static struct itimerval it;
   static u32 prev_timed_out = 0;
@@ -2314,9 +2323,10 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
   u32 tb4;
 
   child_timed_out = 0;
-  u32 pre = 0, fuzz = 0;
+  u32 pre = 0, fuzz = 0, cfg = 0;
   if(mode == 1) pre = 1;
   else if (mode == 2) fuzz = 1;
+  else if (mode == 3) cfg = 1;
 
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
@@ -2449,11 +2459,10 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
 
   it.it_value.tv_sec = (timeout / 1000);
   it.it_value.tv_usec = (timeout % 1000) * 1000;
-  if(pre) {
-      it.it_value.tv_sec = 3;//(timeout / 1000);
-      it.it_value.tv_usec = 0;//(timeout % 1000) * 1000;
-  }
-
+  if (cfg)
+      it.it_value.tv_sec = 10;
+  else if (pre)
+      it.it_value.tv_sec = 3;
   setitimer(ITIMER_REAL, &it, NULL);
 
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
@@ -2482,8 +2491,8 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
 
     }
-    if(pre) {
-        printf("**********************************************\n");
+    if(cfg || pre) {
+        printf("*********************************************\n");
         printf("status is %d\n", status);
     }
 
@@ -2552,15 +2561,30 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode) {
 }
 
 static u8 run_target(char** argv, u32 timeout) {
-    return _run_target(argv, timeout, 2);
+    if(first_cfg) {
+        cur_mode = CFG;
+        first_cfg = 0;
+        return _run_target(argv, exec_tmout, 3);
+    }
+    else if(first_pre_strace && qemu_mode) {
+        cur_mode = PRE_STRACE;
+        first_pre_strace = 0;
+        return _run_target(argv, exec_tmout, 1);
+    }
+    else if(cur_mode == FUZZ_STRACE) {
+        printf("%s PRE_STRACE timeout, then goto FUZZ_STRACE mode\n", __func__);
+        return _run_target(argv, timeout, 2);
+    }
+    cur_mode = NORMAL;
+    return _run_target(argv, timeout, 0);
 }
 
 /* Write modified data to file for testing. If out_file is set, the old file
    is unlinked and a new one is created. Otherwise, out_fd is rewound and
    truncated. */
 
-static void write_to_testcase(void* mem, u32 len) {
-
+static void write_to_testcase(void* mem, u32 len)
+{
   s32 fd = out_fd;
 
   if (out_file) {
@@ -2572,7 +2596,6 @@ static void write_to_testcase(void* mem, u32 len) {
     if (fd < 0) PFATAL("Unable to create '%s'", out_file);
 
   } else lseek(fd, 0, SEEK_SET);
-
   ck_write(fd, mem, len, out_file);
 
   if (!out_file) {
@@ -2623,7 +2646,8 @@ static void show_stats(void);
    new paths are discovered to detect variable behavior and so on. */
 
 static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
-                         u32 handicap, u8 from_queue) {
+                         u32 handicap, u8 from_queue)
+{                         
 
   static u8 first_trace[MAP_SIZE];
 
@@ -2669,18 +2693,11 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     u32 cksum;
 
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
-
     write_to_testcase(use_mem, q->len);
-    if(first_pre_strace && qemu_mode) {
-        _run_target(argv, exec_tmout, 1);
-        first_pre_strace = 0;
-    } else {
-        fault = run_target(argv, use_tmout);
-    }
+    fault = run_target(argv, use_tmout);
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
-
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
     if (!dumb_mode && !stage_cur && !count_bytes(trace_bits)) {
@@ -2797,8 +2814,8 @@ static void check_map_coverage(void) {
 /* Perform dry run of all test cases to confirm that the app is working as
    expected. This is done only for the initial inputs, and only once. */
 
-static void perform_dry_run(char** argv) {
-
+static void perform_dry_run(char** argv)
+{
   struct queue_entry* q = queue;
   u32 cal_failures = 0;
   u8* skip_crashes = getenv("AFL_SKIP_CRASHES");
@@ -2843,6 +2860,14 @@ static void perform_dry_run(char** argv) {
         break;
 
       case FAULT_TMOUT:
+        
+        printf("%s %d: mode_%d timeout\n", __func__, __LINE__, cur_mode);
+        // stage == cfg
+        if (cur_mode == CFG)
+            break;
+        else if (cur_mode == PRE_STRACE)
+            // if pre_strace timeout, then fuzz_strace
+            cur_mode = FUZZ_STRACE;
 
         if (timeout_given) {
 
@@ -2883,6 +2908,9 @@ static void perform_dry_run(char** argv) {
 
       case FAULT_CRASH:  
 
+        printf("%s %d: mode_%d crash\n", __func__, __LINE__, cur_mode);
+        if (cur_mode == CFG)
+            break;
         if (crash_mode) break;
 
         if (skip_crashes) {
