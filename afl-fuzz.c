@@ -241,8 +241,8 @@ static FILE* plot_file;               /* Gnuplot output file              */
 
 #define FUZZ_STRACE 2
 #define PRE_STRACE 1
-#define NORMAL 0
-#define CFG 3
+#define NORMAL 3
+#define CFG 0
 static int first_pre_strace = 1;
 static int first_cfg = 1;
 static int cur_mode = 0;
@@ -2427,12 +2427,12 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
 
   /* Configure timeout, as requested by user, then wait for child to terminate. */
 
+  if (mode == CFG)
+    timeout = 5000;
+  if (mode == PRE_STRACE)
+    timeout = 3000;
   it.it_value.tv_sec = (timeout / 1000);
   it.it_value.tv_usec = (timeout % 1000) * 1000;
-  if (mode == CFG)
-      it.it_value.tv_sec = 10;
-  if (mode == PRE_STRACE)
-      it.it_value.tv_sec = 3;
   setitimer(ITIMER_REAL, &it, NULL);
 
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
@@ -2451,10 +2451,6 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
       if (stop_soon) return 0;
       RPFATAL(res, "Unable to communicate with fork server (OOM?)");
 
-    }
-    if(mode == PRE_STRACE || mode == CFG) {
-        printf("*********************************************\n");
-        printf("%d status is %d\n", cur_mode, status);
     }
 
   }
@@ -2494,7 +2490,11 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
 
     kill_signal = WTERMSIG(status);
 
-    if (child_timed_out && kill_signal == SIGKILL) return FAULT_TMOUT;
+    if (child_timed_out && kill_signal == SIGKILL) {
+        printf("%d timeout..................\n", cur_mode);
+        return FAULT_TMOUT;
+    }
+        printf("%d crash....................\n", cur_mode);
 
     return FAULT_CRASH;
 
@@ -2521,7 +2521,8 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
 
 }
 
-static u8 run_target(char** argv, u32 timeout) {
+static u8 run_target(char** argv, u32 timeout)
+{
     if(first_cfg) {
         cur_mode = CFG;
         first_cfg = 0;
@@ -2533,7 +2534,6 @@ static u8 run_target(char** argv, u32 timeout) {
         return _run_target(argv, exec_tmout, PRE_STRACE);
     }
     else if(cur_mode == FUZZ_STRACE) {
-        printf("%s PRE_STRACE timeout, then goto FUZZ_STRACE mode\n", __func__);
         return _run_target(argv, timeout, FUZZ_STRACE);
     }
     cur_mode = NORMAL;
@@ -2656,6 +2656,18 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
     if (!first_run && !(stage_cur % stats_update_freq)) show_stats();
     write_to_testcase(use_mem, q->len);
     fault = run_target(argv, use_tmout);
+    if (cur_mode == CFG) {
+        stage_cur--;
+        continue;
+    } else if (cur_mode == PRE_STRACE) {
+        if (fault == FAULT_TMOUT) {
+            printf("%s PRE_STRACE timeout, then goto FUZZ_STRACE mode\n", __func__);
+            cur_mode = FUZZ_STRACE;
+        } else 
+            cur_mode = NORMAL;
+        stage_cur--;
+        continue;
+    }
 
     /* stop_soon is set by the handler for Ctrl+C. When it's pressed,
        we want to bail out quickly. */
@@ -2723,7 +2735,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
      parent. This is a non-critical problem, but something to warn the user
      about. */
 
-  if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
+  if (!dumb_mode && first_run && !fault && !new_bits && cur_mode != CFG && cur_mode != PRE_STRACE)
+      fault = FAULT_NOBITS;
 
 abort_calibration:
 
@@ -2822,14 +2835,6 @@ static void perform_dry_run(char** argv)
 
       case FAULT_TMOUT:
         
-        printf("%s %d: mode_%d timeout\n", __func__, __LINE__, cur_mode);
-        // stage == cfg
-        if (cur_mode == CFG)
-            break;
-        else if (cur_mode == PRE_STRACE)
-            // if pre_strace timeout, then fuzz_strace
-            cur_mode = FUZZ_STRACE;
-
         if (timeout_given) {
 
           /* The -t nn+ syntax in the command line sets timeout_given to '2' and
@@ -2869,9 +2874,6 @@ static void perform_dry_run(char** argv)
 
       case FAULT_CRASH:  
 
-        printf("%s %d: mode_%d crash\n", __func__, __LINE__, cur_mode);
-        if (cur_mode == CFG)
-            break;
         if (crash_mode) break;
 
         if (skip_crashes) {
@@ -3206,7 +3208,8 @@ static void write_crash_readme(void) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
-static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault)
+{
 
   u8  *fn = "";
   u8  hnb;
@@ -3977,7 +3980,7 @@ static void check_term_size(void);
    execve() calls, plus in several other circumstances. */
 
 static void show_stats(void) {
-
+return;
   static u64 last_stats_ms, last_plot_ms, last_ms, last_execs;
   static double avg_exec;
   double t_byte_ratio, stab_ratio;
@@ -4569,7 +4572,8 @@ static u32 next_p2(u32 val) {
    trimmer uses power-of-two increments somewhere between 1/16 and 1/1024 of
    file size, to keep the stage short and sweet. */
 
-static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
+static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf)
+{
 
   static u8 tmp[64];
   static u8 clean_trace[MAP_SIZE];
@@ -4693,10 +4697,10 @@ abort_trimming:
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
 
-EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
+EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len)
+{
 
   u8 fault;
-
   if (post_handler) {
 
     out_buf = post_handler(out_buf, &len);
@@ -5046,7 +5050,8 @@ static u8 could_be_interest(u32 old_val, u32 new_val, u8 blen, u8 check_le) {
    function is a tad too long... returns 0 if fuzzed successfully, 1 if
    skipped or bailed out. */
 
-static u8 fuzz_one(char** argv) {
+static u8 fuzz_one(char** argv)
+{
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
@@ -5057,7 +5062,6 @@ static u8 fuzz_one(char** argv) {
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
-
 #ifdef IGNORE_FINDS
 
   /* In IGNORE_FINDS mode, skip any entries that weren't in the
@@ -6738,7 +6742,8 @@ abandon_entry:
 
 /* Grab interesting test cases from other fuzzers. */
 
-static void sync_fuzzers(char** argv) {
+static void sync_fuzzers(char** argv)
+{
 
   DIR* sd;
   struct dirent* sd_ent;
@@ -7820,7 +7825,8 @@ static void save_cmdline(u32 argc, char** argv) {
 
 /* Main entry point */
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
 
   s32 opt;
   u64 prev_queued = 0;
