@@ -2491,10 +2491,8 @@ static u8 _run_target(char** argv, u32 timeout, u32 mode)
     kill_signal = WTERMSIG(status);
 
     if (child_timed_out && kill_signal == SIGKILL) {
-        printf("%d timeout..................\n", cur_mode);
         return FAULT_TMOUT;
     }
-        printf("%d crash....................\n", cur_mode);
 
     return FAULT_CRASH;
 
@@ -2665,7 +2663,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
             cur_mode = FUZZ_STRACE;
         } else 
             cur_mode = NORMAL;
-        stage_cur--;
+        //stage_cur--;
         continue;
     }
 
@@ -3980,7 +3978,6 @@ static void check_term_size(void);
    execve() calls, plus in several other circumstances. */
 
 static void show_stats(void) {
-return;
   static u64 last_stats_ms, last_plot_ms, last_ms, last_execs;
   static double avg_exec;
   double t_byte_ratio, stab_ratio;
